@@ -6,11 +6,14 @@ import info.thelaughingbuddha.exception.CorruptedDataException;
 import io.appulse.utils.Bytes;
 import io.appulse.utils.ReadBytesUtils;
 import io.appulse.utils.WriteBytesUtils;
+import lombok.Builder;
 import lombok.SneakyThrows;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.Spliterator;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -27,6 +30,7 @@ public class IOQFiles implements AutoCloseable, Iterable<IOQContent> {
 
     private final Function<CorruptedDataException, Boolean> corruptionHandler;
 
+    @Builder
     IOQFiles(@NotNull String queueName,
              @NotNull IOQFileConfig config,
              Boolean restoreFromDisk,
@@ -51,7 +55,7 @@ public class IOQFiles implements AutoCloseable, Iterable<IOQContent> {
 
     @Override
     public Iterator<IOQContent> iterator() {
-
+        return new IOQFilesIterator();
     }
 
     void write(@NotNull Bytes buffer) {
@@ -59,8 +63,35 @@ public class IOQFiles implements AutoCloseable, Iterable<IOQContent> {
         WriteBytesUtils.write(file, buffer);
     }
 
+    @SneakyThrows
     int pollTo(@NotNull Bytes buffer) {
+        return readTo(buffer, files::poll, files::remove);
+    }
 
+    @SneakyThrows
+    int peakTo(@NotNull Bytes buffer) {
+        return readTo(buffer, files::poll, null);
+    }
+
+    boolean isLimitExceeded() {
+        return files.getFilesFromQueue().size() > maxCount;
+    }
+
+    @SneakyThrows
+    long diskSize() {
+        long result = 0;
+        for (Path file : getFiles()) {
+            result += Files.size(file);
+        }
+        return result;
+    }
+
+    Collection<Path> getFiles() {
+        return files.getFilesFromQueue();
+    }
+
+    void remove(Collection<Path> paths) {
+        files.remove(paths);
     }
 
     private int readTo(Bytes buffer, Supplier<Path> supplier, Consumer<Path> actionAfter) {
@@ -96,17 +127,58 @@ public class IOQFiles implements AutoCloseable, Iterable<IOQContent> {
     }
 
     @Override
-    public void forEach(Consumer<? super IOQContent> action) {
-        Iterable.super.forEach(action);
-    }
-
-    @Override
-    public Spliterator<IOQContent> spliterator() {
-        return Iterable.super.spliterator();
-    }
-
-    @Override
     public void close() throws Exception {
         files.close();
+    }
+
+    private class IOQFilesIterator implements Iterator<IOQContent> {
+
+        final Iterator<Path> paths = files.getFilesFromQueue().iterator();
+
+        IOQContent lastReturned;
+
+        IOQContent next;
+
+        @Override
+        @SneakyThrows
+        public boolean hasNext() {
+            if (next != null) {
+                return false;
+            }
+
+            if (!paths.hasNext()) {
+                return false;
+            }
+
+            Path path = paths.next();
+            next = IOQContent.builder()
+                    .file(path)
+                    .offset(0)
+                    .length((int) Files.size(path))
+                    .build();
+
+            return true;
+        }
+
+        @Override
+        public IOQContent next() {
+            if (next != null || hasNext()) {
+                lastReturned = next;
+                next = null;
+                return lastReturned;
+            }
+            throw new NoSuchElementException();
+        }
+
+        @Override
+        @SneakyThrows
+        public void remove() {
+            if (lastReturned == null) {
+                throw new IllegalStateException();
+            }
+            paths.remove();
+            Files.deleteIfExists(lastReturned.getFile());
+            lastReturned = null;
+        }
     }
 }
